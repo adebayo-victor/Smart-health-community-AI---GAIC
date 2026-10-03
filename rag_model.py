@@ -3,8 +3,10 @@ SmartHealth Community AI — Layer 3: PDF Knowledge Base RAG & Station 2 Worker
 WOGAFH x GAIC Cohort 2 (Code for Africa AI Sandbox)
 
 File: smarthealth-community-ai/rag_model.py
-Responsibility: Checks for/creates a PyTorch (.pt) embeddings cache of the 
-Nigerian Standard Treatment Guidelines. Runs Station 2 (RAG & Safety Gate).
+Responsibility: 
+1. Ingests 2016/2022 Nigerian Standard Treatment Guidelines from data/stg_guidelines/*.pdf.
+2. Auto-builds and checks freshness of the PyTorch embeddings cache (stg_embeddings_cache.pt).
+3. Runs Station 2 Background Worker (Safety Gating + Sub-20ms Vector Retrieval) -> deposits into `q_llm`.
 """
 
 import os
@@ -34,11 +36,11 @@ rag_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device
 
 
 # =============================================================================
-# 2. PDF PARSER & CHUNKING HELPER
+# 2. PDF PARSER & SLIDING-WINDOW CHUNKER
 # =============================================================================
 def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_overlap: int = 50) -> list[dict]:
     """
-    Scans folder for .pdf files, extracts text page-by-page, and constructs chunks.
+    Scans folder for .pdf files, extracts raw text page-by-page, and constructs chunks.
     Raises FileNotFoundError if no PDFs exist.
     """
     pdf_files = glob.glob(os.path.join(pdf_folder_path, "*.pdf"))
@@ -46,10 +48,9 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
     # CRITICAL CHECK: Throw error if PDFs are missing
     if not pdf_files:
         raise FileNotFoundError(
-            f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_folder_path}' "
-            f"and no existing cache found at '{CACHE_FILE_PATH}'.\n"
+            f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_folder_path}'.\n"
             f"Please place your official 2016/2022 Nigerian Standard Treatment Guideline "
-            f"PDF files inside the '{pdf_folder_path}' directory."
+            f"PDF files inside '{pdf_folder_path}'."
         )
     
     chunks = []
@@ -65,7 +66,7 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
                 if not page_text or len(page_text.strip()) < 20:
                     continue
                 
-                # Sliding-window chunking (preserves medical context across page boundaries)
+                # Sliding-window chunking (preserves medical context across page splits)
                 words = page_text.split()
                 for i in range(0, len(words), chunk_size - chunk_overlap):
                     chunk_words = words[i : i + chunk_size]
@@ -86,44 +87,68 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
 
 
 # =============================================================================
-# 3. .PT CACHE LOADER & AUTO-BUILDER (Self-Healing Initialization)
+# 3. SELF-HEALING / AUTO-INVALIDATING .PT CACHE LOADER
 # =============================================================================
-def init_or_load_knowledge_base():
+def init_or_load_knowledge_base(pdf_dir: str, cache_path: str, embedding_model, device: str):
     """
     1. Looks for pre-computed `stg_embeddings_cache.pt`.
-    2. If found: Loads vectors into RAM in <0.2 seconds.
-    3. If missing: Parses PDFs, computes vectors, and saves `.pt` cache for future runs.
-    4. If PDFs are missing: Raises FileNotFoundError.
+    2. Checks timestamps of individual .pdf files against the cache file.
+    3. If cache exists and is fresh: Loads vectors into RAM in <0.2 seconds.
+    4. If cache is missing or any PDF is newer: Re-parses PDFs and saves a fresh `.pt` file.
     """
-    if os.path.exists(CACHE_FILE_PATH):
-        print(f"[2/3 Loading Cache] Found pre-computed cache at '{CACHE_FILE_PATH}'. Loading into RAM...")
-        cache_data = torch.load(CACHE_FILE_PATH, map_location=DEVICE, weights_only=False)
-        chunks_db = cache_data["chunks"]
-        embeddings = cache_data["embeddings"].to(DEVICE)
-        print(f"[3/3 Ready] Loaded {len(chunks_db)} guideline vectors instantly from .pt cache.\n")
-        return chunks_db, embeddings
+    pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     
-    print(f"[2/3 Cache Miss] No .pt cache found at '{CACHE_FILE_PATH}'. Building from raw PDFs...")
-    # Step A: Parse raw PDFs (raises FileNotFoundError if missing)
-    chunks_db = extract_and_chunk_pdfs(PDF_DIRECTORY)
+    # Check 1: Ensure PDF directory has source files if no cache exists
+    if not os.path.exists(cache_path) and not pdf_files:
+        raise FileNotFoundError(
+            f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_dir}' "
+            f"and no existing cache found at '{cache_path}'.\n"
+            f"Please place your official 2016/2022 Nigerian Standard Treatment Guideline "
+            f"PDF files inside '{pdf_dir}'."
+        )
+
+    # Check 2: If cache exists, verify freshness against each .pdf file
+    if os.path.exists(cache_path) and pdf_files:
+        cache_mtime = os.path.getmtime(cache_path)
+        latest_pdf_mtime = max(os.path.getmtime(pdf) for pdf in pdf_files)
+        
+        # Freshness check: if no PDF is newer than the cache, load instantly
+        if latest_pdf_mtime <= cache_mtime:
+            print(f"[2/3 Loading Cache] Found fresh pre-computed cache at '{cache_path}'. Loading into RAM...")
+            cache_data = torch.load(cache_path, map_location=device, weights_only=False)
+            chunks_db = cache_data["chunks"]
+            embeddings = cache_data["embeddings"].to(device)
+            print(f"[3/3 Ready] Loaded {len(chunks_db)} guideline vectors in <0.2s from .pt cache.\n")
+            return chunks_db, embeddings
+        else:
+            print("[2/3 Cache Invalidated] New or updated PDF files detected! Rebuilding knowledge base...")
+
+    # Fallback / Rebuild Step: Parse raw PDFs and compute embeddings
+    print(f"[2/3 Cache Miss/Outdated] Building knowledge base from raw PDFs in '{pdf_dir}'...")
+    chunks_db = extract_and_chunk_pdfs(pdf_dir)
     
-    # Step B: Compute dense vector embeddings
-    print("[3/3 Vectorizing] Computing all-MiniLM-L6-v2 embeddings for all chunks...")
+    print("[3/3 Vectorizing] Computing dense all-MiniLM-L6-v2 embeddings for all chunks...")
     corpus_texts = [c["text"] for c in chunks_db]
-    embeddings = rag_model.encode(corpus_texts, convert_to_tensor=True, device=DEVICE)
+    embeddings = embedding_model.encode(corpus_texts, convert_to_tensor=True, device=device)
     
-    # Step C: Save to .pt file for all future boots
-    print(f"[SmartHealth RAG] Saving computed vectors to cache file: '{CACHE_FILE_PATH}'...")
+    # Save fresh cache for future server restarts
+    print(f"[SmartHealth RAG] Saving computed vectors to cache: '{cache_path}'...")
     torch.save({
         "chunks": chunks_db,
         "embeddings": embeddings.cpu()
-    }, CACHE_FILE_PATH)
+    }, cache_path)
     
-    print(f"[SmartHealth RAG] Cache generated and saved successfully!\n")
-    return chunks_db, embeddings.to(DEVICE)
+    print(f"[SmartHealth RAG] Knowledge base cache built and saved successfully!\n")
+    return chunks_db, embeddings.to(device)
 
-# Run initialization at module load
-STG_CHUNKS_DATABASE, stg_embeddings = init_or_load_knowledge_base()
+
+# Initialize Knowledge Base on module import
+STG_CHUNKS_DATABASE, stg_embeddings = init_or_load_knowledge_base(
+    pdf_dir=PDF_DIRECTORY,
+    cache_path=CACHE_FILE_PATH,
+    embedding_model=rag_model,
+    device=DEVICE
+)
 
 
 # =============================================================================
@@ -163,7 +188,7 @@ async def rag_model_worker(max_batch_size: int = 16, timeout_ms: int = 15):
     Station 2 Background Worker.
     - Listens to: `q_rag`
     - Trigger Condition: N=16 text items OR T=15ms timeout
-    - Action: Checks safety triggers, searches PDF vectors, and deposits to `q_llm`
+    - Action: Checks safety triggers, searches PDF vectors in RAM, and deposits to `q_llm`
     """
     print(f"[Worker 2: PDF RAG/Safety Active] Ready on {DEVICE.upper()} (N={max_batch_size}, T={timeout_ms}ms)")
     
