@@ -3,7 +3,7 @@ SmartHealth Community AI — Layer 6: Master Flask Ingress Server & Worker Boots
 WOGAFH x GAIC Cohort 2 (Code for Africa AI Sandbox)
 
 File: app.py
-Responsibility: Runs the 4 SEDA worker loops in an asynchronous background thread,
+Responsibility: Runs the 4 SEDA worker loops in a background thread,
 handles audio/text ingress, and returns DUAL OUTPUTS (Spoken Voice Note + Structured Clinical Text).
 """
 
@@ -12,6 +12,7 @@ import io
 import time
 import asyncio
 import threading
+import concurrent.futures
 import torch
 import torchaudio
 from flask import Flask, request, jsonify, send_from_directory
@@ -109,32 +110,29 @@ def triage_audio_endpoint():
     - Processes through: LID -> STT -> Safety Gate -> RAG -> LLM -> TTS
     - Returns BOTH clinical text advice and the synthesized audio voice note URL!
     """
-    # Check if audio file was provided in multipart form
     audio_file = request.files.get("file") or request.files.get("audio")
     if not audio_file:
-        return jsonify({"error": "Audio file is required (key: 'file' or 'audio')."}), 400
+        return jsonify({"status": "ERROR", "error": "Audio file is required (form key: 'file' or 'audio')."}), 400
         
     raw_bytes = audio_file.read()
     if len(raw_bytes) < 1000:
-        return jsonify({"error": "Audio file is too short or corrupted."}), 400
+        return jsonify({"status": "ERROR", "error": "Audio file is too short or corrupted."}), 400
         
     try:
         # Step 1: Normalize audio to 16kHz
         audio_16k_array, _ = resample_inbound_audio(raw_bytes)
         
-        # Step 2: Create Future in the background pipeline loop
-        future = pipeline_loop.create_future()
+        # Step 2: Create thread-safe concurrent.futures.Future
+        future = concurrent.futures.Future()
         packet = create_patient_packet(audio_16k_array, future)
         
-        # Step 3: DROP INTO QUEUE 1 (STT Station)
+        # Step 3: DROP INTO QUEUE 1 (STT Station) in the background loop
         asyncio.run_coroutine_threadsafe(q_stt.put(packet), pipeline_loop)
         
         # Step 4: AWAIT RESOLUTION FROM STATION 4 (TTS Station)
-        # Blocks this specific HTTP worker without blocking other Flask threads
-        concurrent_future = asyncio.wrap_future(future, loop=pipeline_loop)
-        result = concurrent_future.result(timeout=60.0)
+        result = future.result(timeout=60.0)
         
-        # Format the audio download/stream URL
+        # Format audio download URL
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
         
@@ -146,15 +144,13 @@ def triage_audio_endpoint():
             "patient_transcription": result["transcription"],
             "clinical_safety": {
                 "is_emergency": result["is_emergency"],
-                "emergency_trigger": result["emergency_trigger"],
+                "emergency_trigger": result.get("emergency_trigger"),
                 "fmoh_guideline_matched": result["matched_guideline"]
             },
             "delivery_payload": {
-                # 1. Structured Text Response (For CHEWs / Literacy access)
                 "clinical_advice_text": result["clinical_advice"],
-                # 2. Synthesized Spoken Voice Note (For non-literate patients/TBAs)
                 "audio_voice_note_url": audio_url,
-                "audio_duration_seconds": result["audio_duration"]
+                "audio_duration_seconds": result.get("audio_duration", 0)
             },
             "telemetry": {
                 "total_pipeline_latency_ms": result["total_pipeline_latency_ms"]
@@ -162,7 +158,9 @@ def triage_audio_endpoint():
         })
         
     except Exception as e:
-        return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "ERROR", "error": f"Pipeline execution error: {str(e)}"}), 500
 
 
 @app.route("/api/triage/text", methods=["POST"])
@@ -171,15 +169,15 @@ def triage_text_endpoint():
     Direct Text Ingress (Bypasses STT for sub-second text triage).
     Drops directly into Station 2 (RAG Queue) and returns Text + Audio.
     """
-    # Extract query text from form or JSON payload
     query_text = request.form.get("query_text") or (request.json.get("query_text") if request.is_json else None)
     dialect = request.form.get("dialect") or (request.json.get("dialect") if request.is_json else "pcm")
     
     if not query_text or not query_text.strip():
-        return jsonify({"error": "Field 'query_text' cannot be empty."}), 400
+        return jsonify({"status": "ERROR", "error": "Field 'query_text' cannot be empty."}), 400
         
     try:
-        future = pipeline_loop.create_future()
+        # Create thread-safe concurrent.futures.Future
+        future = concurrent.futures.Future()
         packet = {
             "trace_id": f"trace_{time.time_ns()}",
             "timestamp_start": time.perf_counter(),
@@ -193,25 +191,33 @@ def triage_text_endpoint():
         asyncio.run_coroutine_threadsafe(q_rag.put(packet), pipeline_loop)
         
         # Await completion from Station 4 (TTS)
-        concurrent_future = asyncio.wrap_future(future, loop=pipeline_loop)
-        result = concurrent_future.result(timeout=60.0)
+        result = future.result(timeout=60.0)
         audio_filename = os.path.basename(result["audio_file_path"])
+        audio_url = f"/api/audio/{audio_filename}"
         
         return jsonify({
             "status": "COMPLETED_SUCCESS",
             "trace_id": result["trace_id"],
+            "detected_dialect": dialect,
+            "patient_transcription": result["transcription"],
             "clinical_safety": {
                 "is_emergency": result["is_emergency"],
+                "emergency_trigger": result.get("emergency_trigger"),
                 "fmoh_guideline_matched": result["matched_guideline"]
             },
             "delivery_payload": {
                 "clinical_advice_text": result["clinical_advice"],
-                "audio_voice_note_url": f"/api/audio/{audio_filename}"
+                "audio_voice_note_url": audio_url,
+                "audio_duration_seconds": result.get("audio_duration", 0)
             },
-            "total_latency_ms": result["total_pipeline_latency_ms"]
+            "telemetry": {
+                "total_pipeline_latency_ms": result["total_pipeline_latency_ms"]
+            }
         })
     except Exception as e:
-        return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "ERROR", "error": f"Pipeline execution error: {str(e)}"}), 500
 
 
 @app.route("/api/audio/<filename>", methods=["GET"])
