@@ -12,7 +12,7 @@ import io
 import time
 import asyncio
 import threading
-import concurrent.futures
+import soundfile as sf
 import torch
 import torchaudio
 from flask import Flask, request, jsonify, send_from_directory
@@ -66,20 +66,23 @@ worker_thread.start()
 
 
 # =============================================================================
-# 3. HELPER: AUDIO NORMALIZATION TO 16,000 HZ
+# 3. HELPER: AUDIO NORMALIZATION TO 16,000 HZ (Via SoundFile - No TorchCodec)
 # =============================================================================
 def resample_inbound_audio(audio_bytes: bytes) -> tuple:
     """
-    Converts uploaded voice notes (.wav, .ogg, .mp3) into mono 16,000 Hz NumPy array.
+    Converts uploaded voice notes (.wav, .ogg, .mp3) into mono 16,000 Hz NumPy array using soundfile.
     """
     buffer = io.BytesIO(audio_bytes)
-    waveform, sample_rate = torchaudio.load(buffer)
+    # Read audio array using soundfile (bypasses torchcodec completely)
+    data, sample_rate = sf.read(buffer, dtype="float32")
     
-    # Convert multi-channel stereo to mono
-    if waveform.shape[0] > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    # If stereo (multi-channel), convert to mono
+    if data.ndim > 1:
+        data = data.mean(axis=1)
         
-    # Resample to strictly 16,000 Hz (required by Meta MMS)
+    waveform = torch.from_numpy(data).unsqueeze(0)
+    
+    # Resample to strictly 16,000 Hz if needed
     if sample_rate != 16000:
         resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
         waveform = resampler(waveform)
@@ -88,7 +91,32 @@ def resample_inbound_audio(audio_bytes: bytes) -> tuple:
 
 
 # =============================================================================
-# 4. FLASK API ENDPOINTS (DUAL TEXT + AUDIO DELIVERY)
+# 4. ASYNC TASK RUNNERS (Thread-Safe Pipeline Bridges)
+# =============================================================================
+async def _execute_audio_triage(audio_16k_array):
+    """Coroutine that runs inside pipeline_loop to wait for audio pipeline completion."""
+    future = pipeline_loop.create_future()
+    packet = create_patient_packet(audio_16k_array, future)
+    await q_stt.put(packet)
+    return await future
+
+async def _execute_text_triage(query_text, dialect):
+    """Coroutine that runs inside pipeline_loop to wait for text pipeline completion."""
+    future = pipeline_loop.create_future()
+    packet = {
+        "trace_id": f"trace_{time.time_ns()}",
+        "timestamp_start": time.perf_counter(),
+        "audio_16k": None,
+        "detected_dialect": dialect,
+        "transcription": query_text.strip(),
+        "future": future
+    }
+    await q_rag.put(packet)
+    return await future
+
+
+# =============================================================================
+# 5. FLASK API ENDPOINTS (DUAL TEXT + AUDIO DELIVERY)
 # =============================================================================
 
 @app.route("/", methods=["GET"])
@@ -107,7 +135,6 @@ def triage_audio_endpoint():
     """
     Primary Voice Note Ingress (Mobile App / Telegram Webhook).
     - Ingests raw voice note
-    - Processes through: LID -> STT -> Safety Gate -> RAG -> LLM -> TTS
     - Returns BOTH clinical text advice and the synthesized audio voice note URL!
     """
     audio_file = request.files.get("file") or request.files.get("audio")
@@ -119,24 +146,19 @@ def triage_audio_endpoint():
         return jsonify({"status": "ERROR", "error": "Audio file is too short or corrupted."}), 400
         
     try:
-        # Step 1: Normalize audio to 16kHz
+        # Step 1: Normalize audio to 16kHz via soundfile
         audio_16k_array, _ = resample_inbound_audio(raw_bytes)
         
-        # Step 2: Create thread-safe concurrent.futures.Future
-        future = concurrent.futures.Future()
-        packet = create_patient_packet(audio_16k_array, future)
-        
-        # Step 3: DROP INTO QUEUE 1 (STT Station) in the background loop
-        asyncio.run_coroutine_threadsafe(q_stt.put(packet), pipeline_loop)
-        
-        # Step 4: AWAIT RESOLUTION FROM STATION 4 (TTS Station)
-        result = future.result(timeout=60.0)
+        # Step 2: Run pipeline safely across threads
+        task_coro = _execute_audio_triage(audio_16k_array)
+        thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
+        result = thread_future.result(timeout=60.0)
         
         # Format audio download URL
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
         
-        # Step 5: RETURN DUAL PAYLOAD (TEXT + SPEECH)
+        # Step 3: RETURN DUAL PAYLOAD (TEXT + SPEECH)
         return jsonify({
             "status": "COMPLETED_SUCCESS",
             "trace_id": result["trace_id"],
@@ -160,7 +182,7 @@ def triage_audio_endpoint():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"status": "ERROR", "error": f"Pipeline execution error: {str(e)}"}), 500
+        return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
 
 
 @app.route("/api/triage/text", methods=["POST"])
@@ -176,22 +198,11 @@ def triage_text_endpoint():
         return jsonify({"status": "ERROR", "error": "Field 'query_text' cannot be empty."}), 400
         
     try:
-        # Create thread-safe concurrent.futures.Future
-        future = concurrent.futures.Future()
-        packet = {
-            "trace_id": f"trace_{time.time_ns()}",
-            "timestamp_start": time.perf_counter(),
-            "audio_16k": None,
-            "detected_dialect": dialect,
-            "transcription": query_text.strip(),
-            "future": future
-        }
+        # Run text triage safely across threads
+        task_coro = _execute_text_triage(query_text, dialect)
+        thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
+        result = thread_future.result(timeout=60.0)
         
-        # DROP DIRECTLY INTO QUEUE 2 (RAG Station)
-        asyncio.run_coroutine_threadsafe(q_rag.put(packet), pipeline_loop)
-        
-        # Await completion from Station 4 (TTS)
-        result = future.result(timeout=60.0)
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
         
@@ -217,7 +228,7 @@ def triage_text_endpoint():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"status": "ERROR", "error": f"Pipeline execution error: {str(e)}"}), 500
+        return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
 
 
 @app.route("/api/audio/<filename>", methods=["GET"])
@@ -230,7 +241,7 @@ def get_audio_file(filename: str):
 
 
 # =============================================================================
-# 5. LOCAL RUNNER
+# 6. LOCAL RUNNER
 # =============================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
