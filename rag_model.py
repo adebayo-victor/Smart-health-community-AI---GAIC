@@ -4,18 +4,21 @@ WOGAFH x GAIC Cohort 2 (Code for Africa AI Sandbox)
 
 File: smarthealth-community-ai/rag_model.py
 Responsibility: 
-1. Ingests 2016/2022 Nigerian Standard Treatment Guidelines from data/stg_guidelines/*.pdf.
-2. Auto-builds and checks freshness of the PyTorch embeddings cache (stg_embeddings_cache.pt).
-3. Runs Station 2 Background Worker (Safety Gating + Sub-20ms Vector Retrieval) -> deposits into `q_llm`.
+1. Ingests Nigerian Standard Treatment Guidelines from data/stg_guidelines/*.pdf.
+2. Auto-builds and checks freshness of the PyTorch embeddings cache.
+3. Runs Station 2 Background Worker: Translates to English -> Safety Gate -> Top-3 Vector Retrieval -> deposits into `q_llm`.
 """
 
 import os
 import glob
 import asyncio
+import re
 import torch
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, util
+from transformers import pipeline # For zero-shot emergency detection
 from core_engine import q_rag, q_llm, collect_batch
+from translator_model import translate_to_english
 
 # =============================================================================
 # 0. HARDWARE & DIRECTORY CONFIGURATION
@@ -27,30 +30,33 @@ CACHE_FILE_PATH = os.path.join(PDF_DIRECTORY, "stg_embeddings_cache.pt")
 print(f"[SmartHealth RAG] Initializing retrieval engine on: {DEVICE.upper()}")
 os.makedirs(PDF_DIRECTORY, exist_ok=True)
 
-
 # =============================================================================
-# 1. LOAD EMBEDDING MODEL (`all-MiniLM-L6-v2` - 80MB)
+# 1. LOAD EMBEDDING MODEL & ZERO-SHOT CLASSIFIER
 # =============================================================================
 print("[1/3 Loading] all-MiniLM-L6-v2 Embedding Model...")
 rag_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=DEVICE)
 
+print("[2/3 Loading] Zero-Shot Emergency Classifier (No fine-tuning needed)...")
+# This model can classify text into ANY labels we give it, in English.
+# We use a small, fast version to keep latency under 50ms.
+emergency_classifier = pipeline(
+    "zero-shot-classification", 
+    model="typeform/distilbert-base-uncased-mnli", 
+    device=0 if DEVICE == "cuda" else -1
+)
+
+EMERGENCY_LABELS = ["urgent medical emergency", "routine health inquiry", "general conversation"]
 
 # =============================================================================
-# 2. PDF PARSER & SLIDING-WINDOW CHUNKER
+# 2. PDF PARSER & SLIDING-WINDOW CHUNKER (Kept as requested)
 # =============================================================================
 def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_overlap: int = 50) -> list[dict]:
-    """
-    Scans folder for .pdf files, extracts raw text page-by-page, and constructs chunks.
-    Raises FileNotFoundError if no PDFs exist.
-    """
     pdf_files = glob.glob(os.path.join(pdf_folder_path, "*.pdf"))
     
-    # CRITICAL CHECK: Throw error if PDFs are missing
     if not pdf_files:
         raise FileNotFoundError(
             f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_folder_path}'.\n"
-            f"Please place your official 2016/2022 Nigerian Standard Treatment Guideline "
-            f"PDF files inside '{pdf_folder_path}'."
+            f"Please place your official Nigerian Standard Treatment Guideline PDF files inside this folder."
         )
     
     chunks = []
@@ -66,7 +72,7 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
                 if not page_text or len(page_text.strip()) < 20:
                     continue
                 
-                # Sliding-window chunking (preserves medical context across page splits)
+                # Your original word-based sliding window
                 words = page_text.split()
                 for i in range(0, len(words), chunk_size - chunk_overlap):
                     chunk_words = words[i : i + chunk_size]
@@ -85,62 +91,40 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
     print(f"[SmartHealth RAG] Extracted and constructed {len(chunks)} total guideline chunks.")
     return chunks
 
-
 # =============================================================================
 # 3. SELF-HEALING / AUTO-INVALIDATING .PT CACHE LOADER
 # =============================================================================
 def init_or_load_knowledge_base(pdf_dir: str, cache_path: str, embedding_model, device: str):
-    """
-    1. Looks for pre-computed `stg_embeddings_cache.pt`.
-    2. Checks timestamps of individual .pdf files against the cache file.
-    3. If cache exists and is fresh: Loads vectors into RAM in <0.2 seconds.
-    4. If cache is missing or any PDF is newer: Re-parses PDFs and saves a fresh `.pt` file.
-    """
     pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     
-    # Check 1: Ensure PDF directory has source files if no cache exists
     if not os.path.exists(cache_path) and not pdf_files:
         raise FileNotFoundError(
-            f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_dir}' "
-            f"and no existing cache found at '{cache_path}'.\n"
-            f"Please place your official 2016/2022 Nigerian Standard Treatment Guideline "
-            f"PDF files inside '{pdf_dir}'."
+            f"\n[CRITICAL ERROR] No PDF guidelines found in '{pdf_dir}' and no existing cache.\n"
+            f"Please add STG PDF files to '{pdf_dir}'."
         )
 
-    # Check 2: If cache exists, verify freshness against each .pdf file
     if os.path.exists(cache_path) and pdf_files:
         cache_mtime = os.path.getmtime(cache_path)
         latest_pdf_mtime = max(os.path.getmtime(pdf) for pdf in pdf_files)
         
-        # Freshness check: if no PDF is newer than the cache, load instantly
         if latest_pdf_mtime <= cache_mtime:
-            print(f"[2/3 Loading Cache] Found fresh pre-computed cache at '{cache_path}'. Loading into RAM...")
+            print(f"[3/3 Loading Cache] Found fresh pre-computed cache. Loading into RAM...")
             cache_data = torch.load(cache_path, map_location=device, weights_only=False)
-            chunks_db = cache_data["chunks"]
-            embeddings = cache_data["embeddings"].to(device)
-            print(f"[3/3 Ready] Loaded {len(chunks_db)} guideline vectors in <0.2s from .pt cache.\n")
-            return chunks_db, embeddings
+            return cache_data["chunks"], cache_data["embeddings"].to(device)
         else:
-            print("[2/3 Cache Invalidated] New or updated PDF files detected! Rebuilding knowledge base...")
+            print("[3/3 Cache Invalidated] New PDF files detected! Rebuilding knowledge base...")
 
-    # Fallback / Rebuild Step: Parse raw PDFs and compute embeddings
-    print(f"[2/3 Cache Miss/Outdated] Building knowledge base from raw PDFs in '{pdf_dir}'...")
+    print(f"[3/3 Cache Miss] Building knowledge base from raw PDFs in '{pdf_dir}'...")
     chunks_db = extract_and_chunk_pdfs(pdf_dir)
     
-    print("[3/3 Vectorizing] Computing dense all-MiniLM-L6-v2 embeddings for all chunks...")
+    print("[4/4 Vectorizing] Computing dense embeddings for all chunks...")
     corpus_texts = [c["text"] for c in chunks_db]
     embeddings = embedding_model.encode(corpus_texts, convert_to_tensor=True, device=device)
     
-    # Save fresh cache for future server restarts
     print(f"[SmartHealth RAG] Saving computed vectors to cache: '{cache_path}'...")
-    torch.save({
-        "chunks": chunks_db,
-        "embeddings": embeddings.cpu()
-    }, cache_path)
+    torch.save({"chunks": chunks_db, "embeddings": embeddings.cpu()}, cache_path)
     
-    print(f"[SmartHealth RAG] Knowledge base cache built and saved successfully!\n")
     return chunks_db, embeddings.to(device)
-
 
 # Initialize Knowledge Base on module import
 STG_CHUNKS_DATABASE, stg_embeddings = init_or_load_knowledge_base(
@@ -150,72 +134,87 @@ STG_CHUNKS_DATABASE, stg_embeddings = init_or_load_knowledge_base(
     device=DEVICE
 )
 
-
 # =============================================================================
-# 4. HELPER FUNCTIONS: SAFETY GATE & VECTOR SEARCH
+# 4. HELPER FUNCTIONS: SAFETY GATE & TOP-K VECTOR SEARCH
 # =============================================================================
-def check_emergency_triggers(text: str) -> tuple[bool, str]:
+def check_emergency(text: str) -> tuple[bool, str]:
     """
-    Sub-5ms deterministic regex/keyword filter for acute obstetric red flags.
-    Checks Hausa, Pidgin, and English emergency terms.
+    Two-Layer Safety Gate:
+    Layer 1: Instant Regex with word boundaries (\b) to prevent partial word false positives.
+    Layer 2: Zero-Shot Classification on the text to catch contextual emergencies.
     """
     text_lower = text.lower()
+    
+    # Layer 1: Deterministic Regex (Sub-1ms)
     emergency_keywords = [
-        "zubar jini", "jini da yawa", "bleeding heavily", "blood clot",
-        "seeing flashes", "flashes of light", "convulsion", "faint", "dizzy on standing"
+        r"\bzubar jini\b", r"\bjini da yawa\b", r"\bbleeding heavily\b", 
+        r"\bblood clot\b", r"\bconvulsion\b", r"\bfaint\b", r"\bgreen water\b"
     ]
-    for keyword in emergency_keywords:
-        if keyword in text_lower:
-            return True, keyword
+    for pattern in emergency_keywords:
+        if re.search(pattern, text_lower):
+            return True, f"Regex Match: {pattern}"
+            
+    # Layer 2: Zero-Shot Classifier (Catches context like "my water broke and it's green")
+    # We run this on the English translation for maximum accuracy
+    try:
+        result = emergency_classifier(text, candidate_labels=EMERGENCY_LABELS)
+        top_label = result['labels'][0]
+        top_score = result['scores'][0]
+        
+        # If the model is > 85% confident it's an emergency, trigger it
+        if top_label == "urgent medical emergency" and top_score > 0.85:
+            return True, f"Zero-Shot Match: {top_label} ({top_score:.2f})"
+    except Exception as e:
+        print(f"[RAG Warning] Zero-shot classifier failed: {e}")
+        
     return False, ""
 
-
-def retrieve_stg_guideline(query_text: str) -> dict:
+def retrieve_top_k_stg_guidelines(query_text: str, top_k: int = 3) -> list[dict]:
     """
-    Embeds query and computes Cosine Similarity against all cached STG vectors in <20ms.
+    Embeds query and computes Cosine Similarity, returning Top-K chunks 
+    to serve as robust "memory" for the LLM.
     """
     query_vector = rag_model.encode(query_text, convert_to_tensor=True, device=DEVICE)
     cosine_scores = util.cos_sim(query_vector, stg_embeddings)[0]
-    top_index = int(torch.argmax(cosine_scores))
-    return STG_CHUNKS_DATABASE[top_index]
-
+    
+    # Get indices of the top K highest scores
+    top_k_indices = torch.topk(cosine_scores, k=min(top_k, len(STG_CHUNKS_DATABASE))).indices
+    
+    return [STG_CHUNKS_DATABASE[int(idx)] for idx in top_k_indices]
 
 # =============================================================================
 # 5. STATION 2 ASYNC WORKER LOOP (The Library & Safety Gate)
 # =============================================================================
 async def rag_model_worker(max_batch_size: int = 16, timeout_ms: int = 15):
-    """
-    Station 2 Background Worker.
-    - Listens to: `q_rag`
-    - Trigger Condition: N=16 text items OR T=15ms timeout
-    - Action: Checks safety triggers, searches PDF vectors in RAM, and deposits to `q_llm`
-    """
     print(f"[Worker 2: PDF RAG/Safety Active] Ready on {DEVICE.upper()} (N={max_batch_size}, T={timeout_ms}ms)")
     
     while True:
-        # Collect batch using our N or T rule
         batch = await collect_batch(q_rag, max_batch_size, timeout_ms)
         
-        # Batch vectorization of all query texts in 1 single forward pass
-        query_texts = [item["transcription"] for item in batch]
-        query_vectors = rag_model.encode(query_texts, convert_to_tensor=True, device=DEVICE)
+        # CRITICAL FIX 1: Translate all queries to English FIRST for accurate RAG retrieval
+        english_queries = [
+            translate_to_english(item["transcription"], item["detected_dialect"]) 
+            for item in batch
+        ]
+        
+        # Batch vectorization of the ENGLISH queries
+        query_vectors = rag_model.encode(english_queries, convert_to_tensor=True, device=DEVICE)
         
         for idx, item in enumerate(batch):
             try:
                 transcript = item["transcription"]
+                english_query = english_queries[idx]
                 
-                # Step 1: Run Deterministic Safety Filter
-                is_emergency, trigger_word = check_emergency_triggers(transcript)
+                # Step 1: Run Two-Layer Safety Filter on the English query
+                is_emergency, trigger_reason = check_emergency(english_query)
                 
-                # Step 2: Retrieve Top-1 Matching Chunk from Vector Matrix
-                cosine_scores = util.cos_sim(query_vectors[idx], stg_embeddings)[0]
-                top_index = int(torch.argmax(cosine_scores))
-                matched_chunk = STG_CHUNKS_DATABASE[top_index]
+                # Step 2: Retrieve Top-3 Matching Chunks from Vector Matrix (LLM Memory)
+                top_k_chunks = retrieve_top_k_stg_guidelines(english_query, top_k=3)
                 
-                # Step 3: Populate packet with PDF chunk and metadata
+                # Step 3: Populate packet
                 item["is_emergency"] = is_emergency
-                item["emergency_trigger"] = trigger_word
-                item["matched_guideline"] = matched_chunk
+                item["emergency_trigger"] = trigger_reason
+                item["matched_guidelines"] = top_k_chunks # Changed to plural for Top-K
                 
                 # Step 4: HAND OFF TO STATION 3 (LLM Gateway Queue)
                 await q_llm.put(item)
