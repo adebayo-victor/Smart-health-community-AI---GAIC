@@ -28,7 +28,6 @@ client = OpenAI(
     api_key=TEAM_KEY
 )
 
-
 # =============================================================================
 # 1. DOCTOR-VALIDATED CLINICAL TRIAGE SYSTEM PROMPT
 # =============================================================================
@@ -39,26 +38,32 @@ CRITICAL CLINICAL RULES FROM OUR MEDICAL OFFICER:
 2. FIRST AID ONLY: Provide safe, over-the-counter first aid only (e.g. Paracetamol for pain, ORS for dehydration, shock positioning by elevating legs).
 3. MANDATORY FACILITY REFERRAL: Always instruct the patient or Traditional Birth Attendant to proceed immediately to the nearest Primary Health Centre (PHC) or General Hospital for physical examination, lab swabs, and ultrasound.
 4. BEDSIDE EMPATHY & CALM: Maintain a reassuring, supportive tone to prevent unnecessary patient panic while clearly explaining red-flag symptoms.
-5. GROUNDING: Anchor all medical advice strictly in the provided Nigerian Standard Treatment Guidelines excerpt.
+5. STRICT GROUNDING: Anchor all medical advice strictly in the provided Nigerian Standard Treatment Guidelines excerpts.
+6. NO HALLUCINATION: If the provided guidelines do not directly address the patient's symptom, explicitly state: "This specific symptom requires an in-person evaluation by a healthcare professional. Please proceed to the nearest clinic." Do not guess or invent medical advice.
 """
-
 
 # =============================================================================
 # 2. PROMPT BUILDER & GATEWAY INFERENCE HELPER
 # =============================================================================
-def query_clinical_llm(patient_text: str, guideline_chunk: dict) -> str:
+def query_clinical_llm(patient_text: str, guideline_chunks: list[dict]) -> str:
     """
-    Constructs the prompt combining the patient's symptom and the retrieved STG chunk,
+    Constructs the prompt combining the patient's symptom and the retrieved Top-3 STG chunks,
     then calls LiteLLM Gateway for clinical reasoning in standard clinical English.
     """
+    # Format the Top-3 chunks into a clean, readable block for the LLM
+    context_block = ""
+    for i, chunk in enumerate(guideline_chunks, start=1):
+        context_block += f"\n[Reference {i}]\n"
+        context_block += f"Source: {chunk.get('source', 'FMoH Guidelines')} (Page {chunk.get('page', 'Unknown')})\n"
+        context_block += f"Protocol: \"{chunk.get('text', '')}\"\n"
+
     user_prompt = f"""PATIENT SYMPTOM / QUERY:
 "{patient_text}"
 
-OFFICIAL NIGERIAN STANDARD TREATMENT GUIDELINE REFERENCE:
-Source Document: {guideline_chunk.get('source', 'FMoH Guidelines')} (Page {guideline_chunk.get('page', 1)})
-Verified Protocol: "{guideline_chunk.get('text', '')}"
+OFFICIAL NIGERIAN STANDARD TREATMENT GUIDELINE REFERENCES:
+{context_block.strip()}
 
-Provide a clear, safe, step-by-step clinical triage and first-aid response in clear English."""
+Provide a clear, safe, step-by-step clinical triage and first-aid response in clear English based *only* on the references above."""
 
     try:
         response = client.chat.completions.create(
@@ -68,16 +73,15 @@ Provide a clear, safe, step-by-step clinical triage and first-aid response in cl
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.2,
-            max_tokens=350
+            max_tokens=400  # Slightly increased to accommodate Top-3 context synthesis
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"[SmartHealth LLM Warning] Gateway call failed: {e}. Applying offline fallback...")
         return (
-            f"This is a serious medical situation. Do not take self-prescribed medications at home. "
-            f"Please proceed immediately to the nearest Primary Health Centre or General Hospital for evaluation."
+            "This is a serious medical situation. Do not take self-prescribed medications at home. "
+            "Please proceed immediately to the nearest Primary Health Centre or General Hospital for evaluation."
         )
-
 
 # =============================================================================
 # 3. STATION 3 ASYNC WORKER LOOP (The Cognitive Core & Translation Bridge)
@@ -98,11 +102,12 @@ async def llm_gateway_worker(max_batch_size: int = 4, timeout_ms: int = 30):
         for item in batch:
             try:
                 transcript = item["transcription"]
-                guideline = item["matched_guideline"]
+                # UPDATED: Now reads the list of Top-3 chunks instead of a single chunk
+                guidelines = item["matched_guidelines"] 
                 dialect = item["detected_dialect"]
                 
                 # Step 1: Execute Reasoning via Gateway (Generates standard clinical advice)
-                english_advice = query_clinical_llm(transcript, guideline)
+                english_advice = query_clinical_llm(transcript, guidelines)
                 
                 # Step 2: Translate advice into the patient's dialect (Pidgin or Hausa)
                 final_speech_text = translate_from_english(english_advice, dialect)
