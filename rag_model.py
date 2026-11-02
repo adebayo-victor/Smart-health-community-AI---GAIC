@@ -19,13 +19,14 @@ from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline # For zero-shot emergency detection
 from core_engine import q_rag, q_llm, collect_batch
 from translator_model import translate_to_english
+from config.loader import PATHS, MODELS, PARAMS, SAFETY, QUEUES
 
 # =============================================================================
 # 0. HARDWARE & DIRECTORY CONFIGURATION
 # =============================================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-PDF_DIRECTORY = os.getenv("PDF_DIRECTORY", "data/stg_guidelines")
-CACHE_FILE_PATH = os.path.join(PDF_DIRECTORY, "stg_embeddings_cache.pt")
+PDF_DIRECTORY = PATHS["pdf_directory"]
+CACHE_FILE_PATH = PATHS["cache_file_path"]
 
 print(f"[SmartHealth RAG] Initializing retrieval engine on: {DEVICE.upper()}")
 os.makedirs(PDF_DIRECTORY, exist_ok=True)
@@ -33,24 +34,22 @@ os.makedirs(PDF_DIRECTORY, exist_ok=True)
 # =============================================================================
 # 1. LOAD EMBEDDING MODEL & ZERO-SHOT CLASSIFIER
 # =============================================================================
-print("[1/3 Loading] all-MiniLM-L6-v2 Embedding Model...")
-rag_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=DEVICE)
+print(f"[1/3 Loading] Embedding Model (`{MODELS['embedding']}`)...")
+rag_model = SentenceTransformer(MODELS["embedding"], device=DEVICE)
 
-print("[2/3 Loading] Zero-Shot Emergency Classifier (No fine-tuning needed)...")
-# This model can classify text into ANY labels we give it, in English.
-# We use a small, fast version to keep latency under 50ms.
+print(f"[2/3 Loading] Zero-Shot Emergency Classifier (`{MODELS['emergency_classifier']}`)...")
 emergency_classifier = pipeline(
     "zero-shot-classification", 
-    model="typeform/distilbert-base-uncased-mnli", 
+    model=MODELS["emergency_classifier"], 
     device=0 if DEVICE == "cuda" else -1
 )
 
-EMERGENCY_LABELS = ["urgent medical emergency", "routine health inquiry", "general conversation"]
+EMERGENCY_LABELS = SAFETY["emergency_labels"]
 
 # =============================================================================
-# 2. PDF PARSER & SLIDING-WINDOW CHUNKER (Kept as requested)
+# 2. PDF PARSER & SLIDING-WINDOW CHUNKER
 # =============================================================================
-def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_overlap: int = 50) -> list[dict]:
+def extract_and_chunk_pdfs(pdf_folder_path: str) -> list[dict]:
     pdf_files = glob.glob(os.path.join(pdf_folder_path, "*.pdf"))
     
     if not pdf_files:
@@ -72,10 +71,10 @@ def extract_and_chunk_pdfs(pdf_folder_path: str, chunk_size: int = 350, chunk_ov
                 if not page_text or len(page_text.strip()) < 20:
                     continue
                 
-                # Your original word-based sliding window
+                # Word-based sliding window using config params
                 words = page_text.split()
-                for i in range(0, len(words), chunk_size - chunk_overlap):
-                    chunk_words = words[i : i + chunk_size]
+                for i in range(0, len(words), PARAMS["chunk_size"] - PARAMS["chunk_overlap"]):
+                    chunk_words = words[i : i + PARAMS["chunk_size"]]
                     chunk_text = " ".join(chunk_words)
                     
                     if len(chunk_text.strip()) > 30:
@@ -146,34 +145,33 @@ def check_emergency(text: str) -> tuple[bool, str]:
     text_lower = text.lower()
     
     # Layer 1: Deterministic Regex (Sub-1ms)
-    emergency_keywords = [
-        r"\bzubar jini\b", r"\bjini da yawa\b", r"\bbleeding heavily\b", 
-        r"\bblood clot\b", r"\bconvulsion\b", r"\bfaint\b", r"\bgreen water\b"
-    ]
+    # We wrap the keywords from config with word boundaries \b
+    emergency_keywords = [r"\b" + keyword + r"\b" for keyword in SAFETY["regex_keywords"]]
+    
     for pattern in emergency_keywords:
         if re.search(pattern, text_lower):
             return True, f"Regex Match: {pattern}"
             
-    # Layer 2: Zero-Shot Classifier (Catches context like "my water broke and it's green")
-    # We run this on the English translation for maximum accuracy
+    # Layer 2: Zero-Shot Classifier
     try:
         result = emergency_classifier(text, candidate_labels=EMERGENCY_LABELS)
         top_label = result['labels'][0]
         top_score = result['scores'][0]
         
-        # If the model is > 85% confident it's an emergency, trigger it
-        if top_label == "urgent medical emergency" and top_score > 0.85:
+        # If the model is > threshold confident it's an emergency, trigger it
+        if top_label == "urgent medical emergency" and top_score > SAFETY["confidence_threshold"]:
             return True, f"Zero-Shot Match: {top_label} ({top_score:.2f})"
     except Exception as e:
         print(f"[RAG Warning] Zero-shot classifier failed: {e}")
         
     return False, ""
 
-def retrieve_top_k_stg_guidelines(query_text: str, top_k: int = 3) -> list[dict]:
+def retrieve_top_k_stg_guidelines(query_text: str) -> list[dict]:
     """
     Embeds query and computes Cosine Similarity, returning Top-K chunks 
     to serve as robust "memory" for the LLM.
     """
+    top_k = PARAMS["top_k_retrieval"]
     query_vector = rag_model.encode(query_text, convert_to_tensor=True, device=DEVICE)
     cosine_scores = util.cos_sim(query_vector, stg_embeddings)[0]
     
@@ -185,7 +183,9 @@ def retrieve_top_k_stg_guidelines(query_text: str, top_k: int = 3) -> list[dict]
 # =============================================================================
 # 5. STATION 2 ASYNC WORKER LOOP (The Library & Safety Gate)
 # =============================================================================
-async def rag_model_worker(max_batch_size: int = 16, timeout_ms: int = 15):
+async def rag_model_worker():
+    max_batch_size = QUEUES["rag"]["max_batch_size"]
+    timeout_ms = QUEUES["rag"]["timeout_ms"]
     print(f"[Worker 2: PDF RAG/Safety Active] Ready on {DEVICE.upper()} (N={max_batch_size}, T={timeout_ms}ms)")
     
     while True:
@@ -208,8 +208,8 @@ async def rag_model_worker(max_batch_size: int = 16, timeout_ms: int = 15):
                 # Step 1: Run Two-Layer Safety Filter on the English query
                 is_emergency, trigger_reason = check_emergency(english_query)
                 
-                # Step 2: Retrieve Top-3 Matching Chunks from Vector Matrix (LLM Memory)
-                top_k_chunks = retrieve_top_k_stg_guidelines(english_query, top_k=3)
+                # Step 2: Retrieve Top-K Matching Chunks from Vector Matrix (LLM Memory)
+                top_k_chunks = retrieve_top_k_stg_guidelines(english_query)
                 
                 # Step 3: Populate packet
                 item["is_emergency"] = is_emergency
