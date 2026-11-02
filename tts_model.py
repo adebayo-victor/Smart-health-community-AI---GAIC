@@ -13,12 +13,13 @@ import torch
 import soundfile as sf
 from transformers import AutoTokenizer, VitsModel
 from core_engine import q_tts, collect_batch
+from config.loader import PATHS, MODELS, PARAMS, QUEUES
 
 # =============================================================================
 # 0. HARDWARE DEVICE CONFIGURATION
 # =============================================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-OUTPUT_AUDIO_DIR = os.getenv("OUTPUT_AUDIO_DIR", "data/audio_outputs")
+OUTPUT_AUDIO_DIR = PATHS["audio_output_dir"]
 os.makedirs(OUTPUT_AUDIO_DIR, exist_ok=True)
 
 print(f"[SmartHealth TTS] Initializing Speech Synthesis Engine on: {DEVICE.upper()}")
@@ -26,14 +27,14 @@ print(f"[SmartHealth TTS] Initializing Speech Synthesis Engine on: {DEVICE.upper
 # =============================================================================
 # 1. LOAD META MMS-TTS VITS MODELS (Hausa & Nigerian Pidgin)
 # =============================================================================
-print("[1/2 Loading] Meta MMS-TTS Hausa (`facebook/mms-tts-hau`)...")
-tts_hau_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-hau")
-tts_hau_model = VitsModel.from_pretrained("facebook/mms-tts-hau").to(DEVICE)
+print(f"[1/2 Loading] Meta MMS-TTS Hausa (`{MODELS['tts_hausa']}`)...")
+tts_hau_tokenizer = AutoTokenizer.from_pretrained(MODELS["tts_hausa"])
+tts_hau_model = VitsModel.from_pretrained(MODELS["tts_hausa"]).to(DEVICE)
 tts_hau_model.eval()
 
-print("[2/2 Loading] Meta MMS-TTS Nigerian Pidgin (`facebook/mms-tts-pcm`)...")
-tts_pcm_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-pcm")
-tts_pcm_model = VitsModel.from_pretrained("facebook/mms-tts-pcm").to(DEVICE)
+print(f"[2/2 Loading] Meta MMS-TTS Nigerian Pidgin (`{MODELS['tts_pidgin']}`)...")
+tts_pcm_tokenizer = AutoTokenizer.from_pretrained(MODELS["tts_pidgin"])
+tts_pcm_model = VitsModel.from_pretrained(MODELS["tts_pidgin"]).to(DEVICE)
 tts_pcm_model.eval()
 
 print("[SmartHealth TTS] Both VITS speech synthesizers loaded successfully into memory!\n")
@@ -55,7 +56,11 @@ def synthesize_audio_file(text: str, dialect_code: str, trace_id: str) -> tuple[
     inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
     
     with torch.no_grad():
-        output_waveform = model(**inputs, noise_scale_w=0.6, length_scale=0.95).waveform
+        output_waveform = model(
+            **inputs, 
+            noise_scale_w=PARAMS["tts_noise_scale_w"], 
+            length_scale=PARAMS["tts_length_scale"]
+        ).waveform
         
     audio_array = output_waveform.squeeze().cpu().numpy()
     sampling_rate = model.config.sampling_rate
@@ -69,7 +74,9 @@ def synthesize_audio_file(text: str, dialect_code: str, trace_id: str) -> tuple[
 # =============================================================================
 # 3. STATION 4 ASYNC WORKER LOOP
 # =============================================================================
-async def tts_model_worker(max_batch_size: int = 4, timeout_ms: int = 40):
+async def tts_model_worker():
+    max_batch_size = QUEUES["tts"]["max_batch_size"]
+    timeout_ms = QUEUES["tts"]["timeout_ms"]
     print(f"[Worker 4: TTS Mouth Active] Ready on {DEVICE.upper()} (N={max_batch_size}, T={timeout_ms}ms)")
     
     while True:
