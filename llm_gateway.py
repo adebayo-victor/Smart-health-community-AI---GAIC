@@ -12,15 +12,15 @@ import asyncio
 from openai import OpenAI
 from core_engine import q_llm, q_tts, collect_batch
 from translator_model import translate_from_english
+from config.loader import API, MODELS, PARAMS, QUEUES
 
 # =============================================================================
 # 0. LITELLM GATEWAY & BEDROCK CONFIGURATION
 # =============================================================================
-LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "https://litellm.codeforafrica.org")
+# Use env vars for secrets, fallback to config for structural defaults
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", API["litellm_base_url"])
 TEAM_KEY = os.getenv("TEAM_KEY", "your_cfa_team_key_here")
-
-# Default model on Amazon Bedrock (eu-west-2) via LiteLLM
-DEFAULT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "bedrock/anthropic.claude-3-haiku-20240307-v1:0")
+DEFAULT_MODEL = os.getenv("DEFAULT_LLM_MODEL", MODELS["llm_default"])
 
 print(f"[SmartHealth LLM] Initializing Gateway Client to: {LITELLM_BASE_URL}")
 client = OpenAI(
@@ -47,10 +47,9 @@ CRITICAL CLINICAL RULES FROM OUR MEDICAL OFFICER:
 # =============================================================================
 def query_clinical_llm(patient_text: str, guideline_chunks: list[dict]) -> str:
     """
-    Constructs the prompt combining the patient's symptom and the retrieved Top-3 STG chunks,
+    Constructs the prompt combining the patient's symptom and the retrieved Top-K STG chunks,
     then calls LiteLLM Gateway for clinical reasoning in standard clinical English.
     """
-    # Format the Top-3 chunks into a clean, readable block for the LLM
     context_block = ""
     for i, chunk in enumerate(guideline_chunks, start=1):
         context_block += f"\n[Reference {i}]\n"
@@ -72,8 +71,8 @@ Provide a clear, safe, step-by-step clinical triage and first-aid response in cl
                 {"role": "system", "content": DOCTOR_TRIAGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.2,
-            max_tokens=400  # Slightly increased to accommodate Top-3 context synthesis
+            temperature=PARAMS["llm_temperature"],
+            max_tokens=PARAMS["llm_max_tokens"]
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -86,30 +85,30 @@ Provide a clear, safe, step-by-step clinical triage and first-aid response in cl
 # =============================================================================
 # 3. STATION 3 ASYNC WORKER LOOP (The Cognitive Core & Translation Bridge)
 # =============================================================================
-async def llm_gateway_worker(max_batch_size: int = 4, timeout_ms: int = 30):
+async def llm_gateway_worker():
     """
     Station 3 Background Worker.
     - Listens to: `q_llm`
-    - Trigger Condition: N=4 items OR T=30ms timeout
-    - Action: Executes clinical reasoning, translates verified advice to the user's dialect (Pidgin or Hausa), and deposits to `q_tts`.
+    - Trigger Condition: N items OR T ms timeout (from config)
+    - Action: Executes clinical reasoning, translates verified advice, deposits to `q_tts`.
     """
+    max_batch_size = QUEUES["llm"]["max_batch_size"]
+    timeout_ms = QUEUES["llm"]["timeout_ms"]
     print(f"[Worker 3: LLM Gateway Active] Connected to {LITELLM_BASE_URL} (N={max_batch_size}, T={timeout_ms}ms)")
     
     while True:
-        # Collect batch using our N or T rule
         batch = await collect_batch(q_llm, max_batch_size, timeout_ms)
         
         for item in batch:
             try:
                 transcript = item["transcription"]
-                # UPDATED: Now reads the list of Top-3 chunks instead of a single chunk
                 guidelines = item["matched_guidelines"] 
                 dialect = item["detected_dialect"]
                 
-                # Step 1: Execute Reasoning via Gateway (Generates standard clinical advice)
+                # Step 1: Execute Reasoning via Gateway
                 english_advice = query_clinical_llm(transcript, guidelines)
                 
-                # Step 2: Translate advice into the patient's dialect (Pidgin or Hausa)
+                # Step 2: Translate advice into the patient's dialect
                 final_speech_text = translate_from_english(english_advice, dialect)
                 
                 # Step 3: Populate packet with speech-ready text
