@@ -22,7 +22,8 @@ from core_engine import q_stt, q_rag, create_patient_packet
 from stt_model import stt_model_worker
 from rag_model import rag_model_worker
 from llm_gateway import llm_gateway_worker
-from tts_model import tts_model_worker, OUTPUT_AUDIO_DIR
+from tts_model import tts_model_worker
+from config.loader import API, PATHS
 
 # =============================================================================
 # 1. FLASK APP INITIALIZATION
@@ -32,7 +33,6 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB max audio upload li
 
 # Dedicated asyncio event loop for SEDA worker stations
 pipeline_loop = asyncio.new_event_loop()
-
 
 # =============================================================================
 # 2. BOOTSTRAP ALL 4 MODEL WORKERS PERMANENTLY IN BACKGROUND THREAD
@@ -46,10 +46,11 @@ def start_background_workers(loop: asyncio.AbstractEventLoop):
     print("\n" + "="*70)
     print("🚀 [SmartHealth Boot] Spawning 4 Staged Event-Driven Workers in Flask...")
     
-    loop.create_task(stt_model_worker(max_batch_size=4, timeout_ms=50))
-    loop.create_task(rag_model_worker(max_batch_size=16, timeout_ms=15))
-    loop.create_task(llm_gateway_worker(max_batch_size=4, timeout_ms=30))
-    loop.create_task(tts_model_worker(max_batch_size=4, timeout_ms=40))
+    # Workers now read their own batch/timeout configs internally
+    loop.create_task(stt_model_worker())
+    loop.create_task(rag_model_worker())
+    loop.create_task(llm_gateway_worker())
+    loop.create_task(tts_model_worker())
     
     print("✓ Station 1 (STT / LID)      : ACTIVE (q_stt)")
     print("✓ Station 2 (RAG / Safety)   : ACTIVE (q_rag)")
@@ -64,7 +65,6 @@ def start_background_workers(loop: asyncio.AbstractEventLoop):
 worker_thread = threading.Thread(target=start_background_workers, args=(pipeline_loop,), daemon=True)
 worker_thread.start()
 
-
 # =============================================================================
 # 3. HELPER: AUDIO NORMALIZATION TO 16,000 HZ (Via SoundFile - No TorchCodec)
 # =============================================================================
@@ -73,22 +73,18 @@ def resample_inbound_audio(audio_bytes: bytes) -> tuple:
     Converts uploaded voice notes (.wav, .ogg, .mp3) into mono 16,000 Hz NumPy array using soundfile.
     """
     buffer = io.BytesIO(audio_bytes)
-    # Read audio array using soundfile (bypasses torchcodec completely)
     data, sample_rate = sf.read(buffer, dtype="float32")
     
-    # If stereo (multi-channel), convert to mono
     if data.ndim > 1:
         data = data.mean(axis=1)
         
     waveform = torch.from_numpy(data).unsqueeze(0)
     
-    # Resample to strictly 16,000 Hz if needed
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+    if sample_rate != API["target_sample_rate"]:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=API["target_sample_rate"])
         waveform = resampler(waveform)
         
-    return waveform.squeeze().numpy(), 16000
-
+    return waveform.squeeze().numpy(), API["target_sample_rate"]
 
 # =============================================================================
 # 4. ASYNC TASK RUNNERS (Thread-Safe Pipeline Bridges)
@@ -114,7 +110,6 @@ async def _execute_text_triage(query_text, dialect):
     await q_rag.put(packet)
     return await future
 
-
 # =============================================================================
 # 5. FLASK API ENDPOINTS (DUAL TEXT + AUDIO DELIVERY)
 # =============================================================================
@@ -129,14 +124,8 @@ def health_check():
         "pipeline_architecture": "Staged Event-Driven Architecture (SEDA / Pipes & Filters)"
     })
 
-
 @app.route("/api/triage/audio", methods=["POST"])
 def triage_audio_endpoint():
-    """
-    Primary Voice Note Ingress (Mobile App / Telegram Webhook).
-    - Ingests raw voice note
-    - Returns BOTH clinical text advice and the synthesized audio voice note URL!
-    """
     audio_file = request.files.get("file") or request.files.get("audio")
     if not audio_file:
         return jsonify({"status": "ERROR", "error": "Audio file is required (form key: 'file' or 'audio')."}), 400
@@ -146,19 +135,15 @@ def triage_audio_endpoint():
         return jsonify({"status": "ERROR", "error": "Audio file is too short or corrupted."}), 400
         
     try:
-        # Step 1: Normalize audio to 16kHz via soundfile
         audio_16k_array, _ = resample_inbound_audio(raw_bytes)
         
-        # Step 2: Run pipeline safely across threads
         task_coro = _execute_audio_triage(audio_16k_array)
         thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
         result = thread_future.result(timeout=60.0)
         
-        # Format audio download URL
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
         
-        # Step 3: RETURN DUAL PAYLOAD (TEXT + SPEECH)
         return jsonify({
             "status": "COMPLETED_SUCCESS",
             "trace_id": result["trace_id"],
@@ -167,7 +152,7 @@ def triage_audio_endpoint():
             "clinical_safety": {
                 "is_emergency": result["is_emergency"],
                 "emergency_trigger": result.get("emergency_trigger"),
-                "fmoh_guideline_matched": result["matched_guideline"]
+                "fmoh_guideline_matched": result["matched_guidelines"] # Fixed pluralization
             },
             "delivery_payload": {
                 "clinical_advice_text": result["clinical_advice"],
@@ -178,19 +163,13 @@ def triage_audio_endpoint():
                 "total_pipeline_latency_ms": result["total_pipeline_latency_ms"]
             }
         })
-        
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
 
-
 @app.route("/api/triage/text", methods=["POST"])
 def triage_text_endpoint():
-    """
-    Direct Text Ingress (Bypasses STT for sub-second text triage).
-    Drops directly into Station 2 (RAG Queue) and returns Text + Audio.
-    """
     query_text = request.form.get("query_text") or (request.json.get("query_text") if request.is_json else None)
     dialect = request.form.get("dialect") or (request.json.get("dialect") if request.is_json else "pcm")
     
@@ -198,7 +177,6 @@ def triage_text_endpoint():
         return jsonify({"status": "ERROR", "error": "Field 'query_text' cannot be empty."}), 400
         
     try:
-        # Run text triage safely across threads
         task_coro = _execute_text_triage(query_text, dialect)
         thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
         result = thread_future.result(timeout=60.0)
@@ -214,7 +192,7 @@ def triage_text_endpoint():
             "clinical_safety": {
                 "is_emergency": result["is_emergency"],
                 "emergency_trigger": result.get("emergency_trigger"),
-                "fmoh_guideline_matched": result["matched_guideline"]
+                "fmoh_guideline_matched": result["matched_guidelines"] # Fixed pluralization
             },
             "delivery_payload": {
                 "clinical_advice_text": result["clinical_advice"],
@@ -230,20 +208,18 @@ def triage_text_endpoint():
         traceback.print_exc()
         return jsonify({"status": "ERROR", "error": f"Pipeline error: {str(e)}"}), 500
 
-
 @app.route("/api/audio/<filename>", methods=["GET"])
 def get_audio_file(filename: str):
     """Serves the generated .wav/.ogg voice notes to mobile/web clients."""
-    file_path = os.path.join(OUTPUT_AUDIO_DIR, filename)
+    file_path = os.path.join(PATHS["audio_output_dir"], filename)
     if not os.path.exists(file_path):
         return jsonify({"error": "Audio file not found."}), 404
-    return send_from_directory(OUTPUT_AUDIO_DIR, filename, mimetype="audio/wav")
-
+    return send_from_directory(PATHS["audio_output_dir"], filename, mimetype="audio/wav")
 
 # =============================================================================
 # 6. LOCAL RUNNER
 # =============================================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", API["port"]))
     print(f"[SmartHealth Flask] Starting server on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
