@@ -1,0 +1,63 @@
+{
+  "paths": {
+    "pdf_directory": "data/stg_guidelines",
+    "cache_file_path": "data/models/stg_embeddings_cache.pt",
+    "audio_output_dir": "data/audio_outputs",
+    "local_models_dir": "data/models"
+  },
+  "models": {
+    "stt_lid": "facebook/mms-lid-126",
+    "stt_base": "facebook/mms-1b-all",
+    "stt_adapters": ["hau", "pcm"],
+    "translator": "facebook/nllb-200-distilled-600M",
+    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
+    "emergency_classifier": "typeform/distilbert-base-uncased-mnli",
+    "tts_hausa": "facebook/mms-tts-hau",
+    "tts_pidgin": "facebook/mms-tts-pcm",
+    "llm_default": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+  },
+  "api": {
+    "litellm_base_url": "https://litellm.codeforafrica.org",
+    "port": 8000,
+    "target_sample_rate": 16000
+  },
+  "languages": {
+    "pcm": "pcm_Latn",
+    "hau": "hau_Latn",
+    "eng": "eng_Latn"
+  },
+  "pipeline_params": {
+    "chunk_size": 350,
+    "chunk_overlap": 50,
+    "top_k_retrieval": 3,
+    "translator_max_length": 150,
+    "translator_num_beams": 4,
+    "tts_noise_scale_w": 0.6,
+    "tts_length_scale": 0.95,
+    "llm_temperature": 0.2,
+    "llm_max_tokens": 400
+  },
+  "worker_queues": {
+    "stt": { "max_batch_size": 4, "timeout_ms": 50 },
+    "rag": { "max_batch_size": 16, "timeout_ms": 15 },
+    "llm": { "max_batch_size": 4, "timeout_ms": 30 },
+    "tts": { "max_batch_size": 4, "timeout_ms": 40 }
+  },
+  "safety_gate": {
+    "emergency_labels": [
+      "urgent medical emergency",
+      "routine health inquiry",
+      "general conversation"
+    ],
+    "confidence_threshold": 0.85,
+    "regex_keywords": [
+      "zubar jini",
+      "jini da yawa",
+      "bleeding heavily",
+      "blood clot",
+      "convulsion",
+      "faint",
+      "green water"
+    ]
+  }
+}
