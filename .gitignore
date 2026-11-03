@@ -1,0 +1,29 @@
+# Environment variables
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Project-specific data (DO NOT COMMIT)
+data/models/
+data/audio_outputs/
+data/stg_guidelines/stg_embeddings_cache.pt
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
