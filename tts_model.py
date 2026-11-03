@@ -54,13 +54,9 @@ def synthesize_audio_file(text: str, dialect_code: str, trace_id: str) -> tuple[
     output_path = os.path.join(OUTPUT_AUDIO_DIR, output_filename)
     
     inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
-    
+    inputs["input_ids"] = inputs["input_ids"].long()
     with torch.no_grad():
-        output_waveform = model(
-            **inputs, 
-            noise_scale_w=PARAMS["tts_noise_scale_w"], 
-            length_scale=PARAMS["tts_length_scale"]
-        ).waveform
+        output_waveform = model(**inputs).waveform
         
     audio_array = output_waveform.squeeze().cpu().numpy()
     sampling_rate = model.config.sampling_rate

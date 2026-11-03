@@ -24,7 +24,9 @@ from rag_model import rag_model_worker
 from llm_gateway import llm_gateway_worker
 from tts_model import tts_model_worker
 from config.loader import API, PATHS
-
+from dotenv import load_dotenv
+#env initialization 
+load_dotenv()
 # =============================================================================
 # 1. FLASK APP INITIALIZATION
 # =============================================================================
@@ -139,7 +141,7 @@ def triage_audio_endpoint():
         
         task_coro = _execute_audio_triage(audio_16k_array)
         thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
-        result = thread_future.result(timeout=60.0)
+        result = thread_future.result(timeout=300.0)
         
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
@@ -179,7 +181,7 @@ def triage_text_endpoint():
     try:
         task_coro = _execute_text_triage(query_text, dialect)
         thread_future = asyncio.run_coroutine_threadsafe(task_coro, pipeline_loop)
-        result = thread_future.result(timeout=60.0)
+        result = thread_future.result(timeout=300.0)
         
         audio_filename = os.path.basename(result["audio_file_path"])
         audio_url = f"/api/audio/{audio_filename}"
