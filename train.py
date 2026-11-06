@@ -1,7 +1,7 @@
 """
-SmartHealth AI - Hausa ASR Fine-Tuning Script
-Fine-tunes facebook/wav2vec2-base with LoRA on the FLEURS Hausa (Nigeria) dataset.
-Optimized for memory-constrained environments (e.g., Codespaces, T4 GPUs).
+SmartHealth AI - Hausa ASR Fine-Tuning Script (Multilingual Upgrade)
+Fine-tunes facebook/wav2vec2-xlsr-53 with LoRA on the FLEURS Hausa (Nigeria) dataset.
+Optimized for memory-constrained environments (e.g., T4 GPUs).
 """
 
 import torch
@@ -22,13 +22,14 @@ import evaluate
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
-MODEL_ID = "facebook/wav2vec2-base"
+# ✅ UPGRADED: Multilingual model that understands African phonemes (ɓ, ɗ, ƙ, ƴ)
+MODEL_ID = "facebook/wav2vec2-xlsr-53" 
 DATASET_NAME = "google/fleurs"
 LANGUAGE_CODE = "ha_ng"  # Hausa - Nigeria
 OUTPUT_DIR = "./smarthealth_mms_hau_lora"
-MAX_STEPS = 200  # Increase to 2000+ for full production training
+MAX_STEPS = 1500  # ✅ UPGRADED: Enough steps to learn from the full dataset
 
-print("🚀 Starting SmartHealth ASR Training Pipeline...")
+print("🚀 Starting SmartHealth ASR Training Pipeline (Multilingual)...")
 
 # ==============================================================================
 # 2. LOAD AND PREPROCESS DATASET
@@ -48,10 +49,9 @@ def remove_special_characters(batch):
 print("Cleaning text...")
 dataset = dataset.map(remove_special_characters)
 
-# For a quick test run, we select a small subset. 
-# Remove .select() to train on the full dataset!
-train_dataset = dataset["train"].select(range(100))
-eval_dataset = dataset["test"].select(range(50))
+# ✅ UPGRADED: Train on the FULL dataset, no limits!
+train_dataset = dataset["train"]
+eval_dataset = dataset["test"]
 
 print(f"✅ Dataset loaded. Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
 
@@ -159,20 +159,20 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=16,         # Effective batch size = 16
     learning_rate=3e-4,
     lr_scheduler_type="cosine",
-    warmup_steps=10,
+    warmup_steps=50,
     max_steps=MAX_STEPS, 
     fp16=True,                              # Crucial for speed and memory
     gradient_checkpointing=True,            # Saves ~40% VRAM
-    eval_strategy="steps",                  # Modern HF API (was evaluation_strategy)
-    eval_steps=50,
-    save_steps=50,
+    eval_strategy="steps",                  
+    eval_steps=100,                         # Evaluate every 100 steps
+    save_steps=100,
     logging_steps=25,
     load_best_model_at_end=True,
     metric_for_best_model="wer",
     greater_is_better=False, 
     push_to_hub=False,
     report_to="none",
-    dataloader_num_workers=0                # Prevents multiprocessing memory leaks
+    dataloader_num_workers=0                
 )
 
 trainer = Trainer(
