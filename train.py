@@ -23,7 +23,7 @@ import evaluate
 # 1. CONFIGURATION
 # ==============================================================================
 # ✅ ULTIMATE UPGRADE: XLSR-53 base, already fine-tuned on Hausa, with a working processor!
-MODEL_ID = "jonatasgrosman/wav2vec2-large-xlsr-53-hausa" 
+MODEL_ID = "infinitejoy/wav2vec2-large-xls-r-300m-hausa" 
 DATASET_NAME = "google/fleurs"
 LANGUAGE_CODE = "ha_ng"  # Hausa - Nigeria
 OUTPUT_DIR = "./smarthealth_mms_hau_lora"
