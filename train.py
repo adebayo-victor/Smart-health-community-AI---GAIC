@@ -23,7 +23,7 @@ import evaluate
 # 1. CONFIGURATION
 # ==============================================================================
 # ✅ UPGRADED: Multilingual model that understands African phonemes (ɓ, ɗ, ƙ, ƴ)
-MODEL_ID = "facebook/wav2vec2-xlsr-53" 
+MODEL_ID = "facebook/wav2vec2-large-xlsr-53" 
 DATASET_NAME = "google/fleurs"
 LANGUAGE_CODE = "ha_ng"  # Hausa - Nigeria
 OUTPUT_DIR = "./smarthealth_mms_hau_lora"
