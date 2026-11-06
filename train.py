@@ -22,8 +22,8 @@ import evaluate
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
-# ✅ UPGRADED: Multilingual model that understands African phonemes (ɓ, ɗ, ƙ, ƴ)
-MODEL_ID = "facebook/wav2vec2-large-xlsr-53" 
+# ✅ ULTIMATE UPGRADE: XLSR-53 base, already fine-tuned on Hausa, with a working processor!
+MODEL_ID = "jonatasgrosman/wav2vec2-large-xlsr-53-hausa" 
 DATASET_NAME = "google/fleurs"
 LANGUAGE_CODE = "ha_ng"  # Hausa - Nigeria
 OUTPUT_DIR = "./smarthealth_mms_hau_lora"
