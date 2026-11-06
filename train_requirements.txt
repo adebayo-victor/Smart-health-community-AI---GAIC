@@ -1,0 +1,9 @@
+transformers>=4.45.0
+datasets>=3.0.0
+peft>=0.13.0
+accelerate
+evaluate
+jiwer
+soundfile
+torch
+torchaudio
