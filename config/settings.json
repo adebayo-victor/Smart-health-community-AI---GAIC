@@ -7,10 +7,10 @@
   },
   "models": {
     "stt_lid": "facebook/mms-lid-126",
-    "stt_base": "facebook/mms-1b-all",
+    "stt_base": "Tushe/wav2vec2-hausa-speech-better",
     "stt_adapters": ["hau", "pcm"],
     "translator": "facebook/nllb-200-distilled-600M",
-    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding": "BAAI/bge-m3",
     "emergency_classifier": "typeform/distilbert-base-uncased-mnli",
     "tts_hausa": "facebook/mms-tts-hau",
     "tts_pidgin": "facebook/mms-tts-pcm",
@@ -29,7 +29,7 @@
   "pipeline_params": {
     "chunk_size": 350,
     "chunk_overlap": 50,
-    "top_k_retrieval": 3,
+    "top_k_retrieval": 5,
     "translator_max_length": 150,
     "translator_num_beams": 4,
     "tts_noise_scale_w": 0.6,
